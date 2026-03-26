@@ -1,0 +1,127 @@
+name: Toy Editor Windows Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-toy-editor:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      SOURCE_TAG: source-build
+      SOURCE_ARCHIVE: godot-toy-editor-source.zip
+      PYTHONIOENCODING: utf8
+
+    steps:
+      - name: Download source archive from release
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "User-Agent" = "Codex"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $release = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$env:SOURCE_TAG"
+          $asset = $release.assets | Where-Object { $_.name -eq $env:SOURCE_ARCHIVE } | Select-Object -First 1
+          if (-not $asset) {
+            throw "Source archive asset '$env:SOURCE_ARCHIVE' was not found on release tag '$env:SOURCE_TAG'."
+          }
+          $downloadHeaders = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/octet-stream"
+            "User-Agent" = "Codex"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $zipPath = Join-Path $env:RUNNER_TEMP $env:SOURCE_ARCHIVE
+          Invoke-WebRequest -Headers $downloadHeaders -Uri $asset.url -OutFile $zipPath -UseBasicParsing
+          $extractRoot = Join-Path $env:RUNNER_TEMP "toy-editor-source"
+          Expand-Archive -Path $zipPath -DestinationPath $extractRoot -Force
+          $sourceRoot = Join-Path $extractRoot "godot-toy-editor-source"
+          if (-not (Test-Path $sourceRoot)) {
+            throw "Expected extracted source root '$sourceRoot' was not found."
+          }
+          "SOURCE_ROOT=$sourceRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+          architecture: x64
+
+      - name: Install SCons
+        shell: bash
+        run: |
+          python -c "import sys; print(sys.version)"
+          python -m pip install scons==4.10.1
+          scons --version
+
+      - name: Download Direct3D 12 SDK components
+        shell: bash
+        id: d3d12-sdk
+        run: |
+          if python "$SOURCE_ROOT/misc/scripts/install_d3d12_sdk_windows.py"; then
+            echo "D3D12_ENABLED=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Windows: Direct3D 12 SDK installation failed, building without Direct3D 12 support."
+            echo "D3D12_ENABLED=no" >> "$GITHUB_OUTPUT"
+          fi
+        continue-on-error: true
+
+      - name: Download pre-built ANGLE static libraries
+        uses: dsaltares/fetch-gh-release-asset@1.1.2
+        with:
+          repo: godotengine/godot-angle-static
+          version: tags/chromium/6601.2
+          file: godot-angle-static-x86_64-msvc-release.zip
+          target: angle/angle.zip
+
+      - name: Extract pre-built ANGLE static libraries
+        shell: pwsh
+        run: Expand-Archive -Force angle/angle.zip ${{ github.workspace }}/
+
+      - name: Download pre-built AccessKit
+        shell: bash
+        id: accesskit-sdk
+        run: |
+          if python "$SOURCE_ROOT/misc/scripts/install_accesskit.py"; then
+            echo "ACCESSKIT_ENABLED=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::AccessKit SDK installation failed, building without AccessKit support."
+            echo "ACCESSKIT_ENABLED=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Windows editor
+        shell: bash
+        run: |
+          cd "$SOURCE_ROOT"
+          scons \
+            platform=windows \
+            target=editor \
+            dev_mode=yes \
+            module_text_server_fb_enabled=yes \
+            debug_symbols=no \
+            windows_subsystem=console \
+            "angle_libs=${{ github.workspace }}/" \
+            d3d12=${{ steps.d3d12-sdk.outputs.D3D12_ENABLED }} \
+            accesskit=${{ steps.accesskit-sdk.outputs.ACCESSKIT_ENABLED }}
+
+      - name: Smoke test editor binary
+        shell: pwsh
+        run: |
+          & "$env:SOURCE_ROOT\\bin\\godot.windows.editor.x86_64.exe" --version
+          & "$env:SOURCE_ROOT\\bin\\godot.windows.editor.x86_64.exe" --help
+
+      - name: Upload Windows editor artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: toy-editor-windows
+          path: |
+            ${{ env.SOURCE_ROOT }}/bin/godot.windows.editor.x86_64.exe
+            ${{ env.SOURCE_ROOT }}/bin/*.dll
+          retention-days: 30
