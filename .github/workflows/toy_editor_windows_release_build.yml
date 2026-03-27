@@ -13,6 +13,7 @@ jobs:
     env:
       SOURCE_TAG: source-build
       SOURCE_ARCHIVE: godot-toy-editor-source.zip
+      SCONS_CACHE_MSVC_CONFIG: true
       PYTHONIOENCODING: utf8
 
     steps:
@@ -55,7 +56,7 @@ jobs:
           architecture: x64
 
       - name: Install SCons
-        shell: bash
+        shell: sh
         run: |
           python -c "import sys; print(sys.version)"
           python -m pip install scons==4.10.1
@@ -74,12 +75,11 @@ jobs:
         continue-on-error: true
 
       - name: Download pre-built ANGLE static libraries
-        uses: dsaltares/fetch-gh-release-asset@1.1.2
-        with:
-          repo: godotengine/godot-angle-static
-          version: tags/chromium/6601.2
-          file: godot-angle-static-x86_64-msvc-release.zip
-          target: angle/angle.zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path angle | Out-Null
+          $angleUrl = "https://github.com/godotengine/godot-angle-static/releases/download/chromium%2F6601.2/godot-angle-static-x86_64-msvc-release.zip"
+          Invoke-WebRequest -Uri $angleUrl -OutFile "angle/angle.zip" -UseBasicParsing
 
       - name: Extract pre-built ANGLE static libraries
         shell: pwsh
@@ -97,25 +97,39 @@ jobs:
           fi
 
       - name: Build Windows editor
-        shell: bash
+        shell: pwsh
         run: |
-          cd "$SOURCE_ROOT"
-          scons \
-            platform=windows \
-            target=editor \
-            dev_mode=yes \
-            module_text_server_fb_enabled=yes \
-            debug_symbols=no \
-            windows_subsystem=console \
-            "angle_libs=${{ github.workspace }}/" \
-            d3d12=${{ steps.d3d12-sdk.outputs.D3D12_ENABLED }} \
-            accesskit=${{ steps.accesskit-sdk.outputs.ACCESSKIT_ENABLED }}
+          $logPath = Join-Path $env:RUNNER_TEMP "scons-build.log"
+          Set-Location $env:SOURCE_ROOT
+          $sconsArgs = @(
+            "platform=windows",
+            "target=editor",
+            "dev_mode=yes",
+            "module_text_server_fb_enabled=yes",
+            "debug_symbols=no",
+            "windows_subsystem=console",
+            "angle_libs=${{ github.workspace }}/",
+            "d3d12=${{ steps.d3d12-sdk.outputs.D3D12_ENABLED }}",
+            "accesskit=${{ steps.accesskit-sdk.outputs.ACCESSKIT_ENABLED }}"
+          )
+          & scons @sconsArgs *>&1 | Tee-Object -FilePath $logPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "SCons failed with exit code $LASTEXITCODE. See scons-build-log artifact."
+          }
 
       - name: Smoke test editor binary
         shell: pwsh
         run: |
           & "$env:SOURCE_ROOT\\bin\\godot.windows.editor.x86_64.exe" --version
           & "$env:SOURCE_ROOT\\bin\\godot.windows.editor.x86_64.exe" --help
+
+      - name: Upload SCons build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scons-build-log
+          path: ${{ runner.temp }}/scons-build.log
+          retention-days: 30
 
       - name: Upload Windows editor artifact
         uses: actions/upload-artifact@v4
